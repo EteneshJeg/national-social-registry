@@ -30,17 +30,21 @@ values — not baked here.
 
 `fixtures.py` is a **contract**, not a private file. The inherited modules that NSR
 does *not* override — `sanity/dci.py`, `sanity/awe_seed.py`,
-`sanity/keycloak_seed.py`, `conftest.py` — import `fixtures.FARMER_*` by name.
+`sanity/keycloak_seed.py`, `conftest.py` — import `fixtures.RECORD_*` by name.
 Renaming a symbol in this overlay leaves them referencing a name that no longer
 exists and every e2e test dies at collection with
 `AttributeError: module 'sanity.fixtures' has no attribute ...`.
 
-So `FARMER_INTERNAL_ID`, `FARMER_FUNCTIONAL_ID`, `FARMER_FOUNDATIONAL_ID`,
-`FARMER`, `cfg.farmer_register_id` and the `farmer_seeded` fixture keep their
-names here. They are historical — they mean "the seeded sanity record" and carry
-whatever register the variant deploys, which for NSR is Individual.
-**Change the values, not the names.** `tests/test_contract.py` in the base image
-enforces this.
+So `RECORD_INTERNAL_ID`, `RECORD_FUNCTIONAL_ID`, `RECORD_FOUNDATIONAL_ID`,
+`RECORD`, `cfg.register_id` and the `record_seeded` fixture keep their names
+here. They mean "the seeded sanity record" and carry whatever register the
+variant deploys, which for NSR is Individual. **Change the values, not the
+names.** `tests/test_contract.py` in the base image enforces this. (The platform
+still accepts the older `FARMER_*` / `farmer_seeded` / `cfg.farmer_register_id`
+names as deprecated aliases; do not use them.)
+
+These names need a registry-platform release that includes the registry-neutral
+sanity names; bump `RP_VERSION` (scripts/bump-rp-version.sh) to one.
 
 ## Extending
 
