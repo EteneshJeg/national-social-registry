@@ -30,7 +30,7 @@ COPY instead of row batches.
 Two things it deliberately does NOT do
 --------------------------------------
 1. It does not invent a geography. Places are read from the deployment's own
-   Master Data geo hierarchy (`g2p_geo_levels` / `g2p_geo_level_values`), so
+   Master Data geography, through MDS's catalogue API (never its database), so
    nothing is hardcoded to a country, a set of level names, or a depth — and
    drill-down keeps working because every generated record points at a geo node
    that MDS actually knows about.
@@ -51,8 +51,13 @@ observed reality rather than uniform noise.
 Usage
 -----
     export PGHOST=localhost PGPORT=5434 PGUSER=postgres PGPASSWORD=...
+    # Master Data, read through its API as the registry's own Keycloak client
+    # (MDS_TOKEN_URL empty sends no token, e.g. against a port-forwarded MDS
+    # with auth off):
+    export MDS_API_URL=http://localhost:8000 MDS_TOKEN_URL=https://keycloak.../token \
+           MDS_CLIENT_ID=nsr-staff-portal MDS_CLIENT_SECRET=...
     python generate_nsr_bulk_sample.py \
-        --db nsr --geo-db master_data \
+        --db nsr \
         --individuals 1000000 \
         --distributions distributions.json
 
@@ -70,6 +75,8 @@ import random
 import sys
 import uuid
 from datetime import date, datetime, timedelta
+
+from pathlib import Path
 
 import psycopg2
 
@@ -358,37 +365,67 @@ def deprived_pick(options, poverty, rng):
 
 
 # --------------------------------------------------------------------------
-# geo, from the deployment's own MDS
+# geo, from the deployment's own MDS — through its API, never its database
 # --------------------------------------------------------------------------
-def load_geo(conn, rng):
+def mds_client():
+    """The Master Data API client (the platform's /seed/mds_client.py).
+
+    Configured from MDS_API_URL / MDS_TOKEN_URL / MDS_CLIENT_ID /
+    MDS_CLIENT_SECRET (Keycloak client credentials, as the registry's own
+    client). Run from a checkout, the client is found in the sibling
+    registry-platform repo. Required: there is no geography without it.
+    """
+    try:
+        from mds_client import MdsClient
+    except ImportError:
+        sibling = Path(__file__).resolve().parents[3] / "registry-platform" / "docker" / "db-seed"
+        if not (sibling / "mds_client.py").is_file():
+            raise SystemExit(
+                "[bulk-seed] mds_client.py is not importable — this db-seed image predates "
+                "the registry platform's Master Data API client (/seed/mds_client.py), and "
+                f"no registry-platform checkout was found at {sibling}.")
+        sys.path.insert(0, str(sibling))
+        from mds_client import MdsClient
+    client = MdsClient.from_env()
+    if client is None:
+        raise SystemExit(
+            "[bulk-seed] MDS_API_URL is not set — the geography is read from Master Data's "
+            "API (set MDS_API_URL, MDS_TOKEN_URL, MDS_CLIENT_ID, MDS_CLIENT_SECRET).")
+    return client
+
+
+def load_geo(mds, rng):
     """Return (leaves, levels) where each leaf carries its full ancestor chain.
 
     Level names, depth and id format all come from MDS. Leaves are given
     lognormal weights so some places are much more populous than others — a
     uniform spread makes every choropleth look flat and hides real problems.
     """
-    with conn.cursor() as cur:
-        cur.execute("select level_id, level_mnemonic, parent_level_id from g2p_geo_levels")
-        levels = {r[0]: {"mnemonic": r[1], "parent": r[2]} for r in cur.fetchall()}
-        cur.execute(
-            "select level_id, level_value_id, level_value_mnemonic, parent_level_value_id"
-            " from g2p_geo_level_values"
-        )
-        values = [
-            {"level_id": r[0], "id": r[1], "name": r[2], "parent": r[3]}
-            for r in cur.fetchall()
-        ]
+    from mds_client import MdsError
+
+    try:
+        ordered = mds.geo_levels()  # top level first
+        units = mds.all_geo_units() if ordered else []
+    except MdsError as exc:
+        raise SystemExit(f"[bulk-seed] cannot read Master Data geography: {exc}")
+    levels = {lv["level_id"]: {"mnemonic": lv.get("level_mnemonic"),
+                               "parent": lv.get("parent_level_id")} for lv in ordered}
+    values = [
+        {"level_id": u["level_id"], "id": u["unit_id"], "name": u.get("name"),
+         "parent": u.get("parent_unit_id")}
+        for u in units
+    ]
 
     if not levels or not values:
         raise SystemExit(
-            "MDS geo hierarchy is empty — seed g2p_geo_levels/g2p_geo_level_values first."
+            "MDS geography is empty — load a country pack into Master Data first "
+            "(the master-data chart's geoSeed.countryPack)."
         )
 
     by_id = {v["id"]: v for v in values}
-    # Deepest level = the one no other level claims as parent.
-    parents = {lv["parent"] for lv in levels.values() if lv["parent"]}
-    leaf_levels = [lid for lid in levels if lid not in parents]
-    leaf_level = sorted(leaf_levels)[-1]
+    # Deepest level = the last of the hierarchy, which MDS's client orders top
+    # down by walking parent -> child (level ids are opaque; never sort them).
+    leaf_level = ordered[-1]["level_id"]
 
     # Poverty is spatially clustered: neighbouring places resemble each other,
     # and a poor region tends to contain poor districts. Drawing it per
@@ -576,8 +613,8 @@ def envelope(kind, seq, link=None):
 # --------------------------------------------------------------------------
 # generation
 # --------------------------------------------------------------------------
-def generate(conn, geo_conn, args, dist, rng):
-    leaves, levels = load_geo(geo_conn, rng)
+def generate(conn, mds, args, dist, rng):
+    leaves, levels = load_geo(mds, rng)
     leaf_weights = [lf["weight"] for lf in leaves]
     print(f"[bulk-seed] geo: {len(leaves)} leaf nodes, depth {len(levels)}")
 
@@ -987,8 +1024,6 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--db", default=os.environ.get("NSR_DB", "nsr"),
                    help="target registry database (default: nsr)")
-    p.add_argument("--geo-db", default=os.environ.get("MDS_DB", "master_data"),
-                   help="database holding the MDS geo hierarchy (default: master_data)")
     p.add_argument("--individuals", type=int, default=1_000_000)
     # distributions.json sits beside this script — both are NSR's, and both are
     # copied into /seed/ by the db-seed image.
@@ -1025,19 +1060,7 @@ def main():
         user=os.environ.get("PGUSER", "postgres"),
         password=os.environ.get("PGPASSWORD", ""),
     )
-    # The geo hierarchy lives in the Master Data database, which in a real
-    # deployment is owned by a different role than the registry — the registry
-    # user gets "permission denied for table g2p_geo_levels". Fall back to the
-    # registry credentials so single-user setups (local, CI) still work.
-    geo_dsn = dict(
-        dsn,
-        host=os.environ.get("MDS_PGHOST") or dsn["host"],
-        port=os.environ.get("MDS_PGPORT") or dsn["port"],
-        user=os.environ.get("MDS_PGUSER") or dsn["user"],
-        password=os.environ.get("MDS_PGPASSWORD") or dsn["password"],
-    )
     conn = psycopg2.connect(dbname=args.db, **dsn)
-    geo_conn = psycopg2.connect(dbname=args.geo_db, **geo_dsn)
 
     if args.purge:
         # Before loading distributions: a purge only deletes, so requiring the
@@ -1110,7 +1133,10 @@ def main():
     started = datetime.now()
     print(f"[bulk-seed] target {args.db} @ {dsn['host']}:{dsn['port']}"
           f"{' (DRY RUN)' if args.dry_run else ''}")
-    totals = generate(conn, geo_conn, args, dist, rng)
+    # The geography is Master Data's, read through its API (never its database)
+    # as this registry's own client. Opened here, after the purge/already-seeded
+    # exits, which need no geography.
+    totals = generate(conn, mds_client(), args, dist, rng)
     elapsed = (datetime.now() - started).total_seconds()
 
     print(f"\n[bulk-seed] done in {elapsed:.0f}s")

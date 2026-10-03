@@ -2,7 +2,10 @@
 """Load sample data into NSR Postgres.
 
 Reads:
-- /openg2p-data/demography/{individuals,households}.csv (core+geo, shared)
+- Master Data, through its API (never its database): the geography, to resolve
+  geo ids, and the country pack's sample people — see mds() below
+- /openg2p-data/demography/{individuals,households}.csv (core+geo, shared), the
+  fallback when Master Data carries no samples
 - /seed/seed-data/*.json (NSR sub-tables, shipped in the db-seed image)
 """
 
@@ -62,10 +65,10 @@ JSON_COLUMNS_HOUSEHOLD = set()
 # Resolution walks the name chain through parent links rather than matching
 # names globally, since a village name repeats under different wards.
 #
-# The slug-path remains as the fallback for when master-data is unreachable, is
-# empty, or was seeded by the legacy loader (load_geo_data.py + geo.csv), whose
-# ids ARE slug-paths. So this works against either style and never does worse
-# than before; whichever path was taken is reported at the end.
+# The slug-path remains as the fallback for when master-data is unreachable or
+# empty, or holds a legacy slug-path geography (the retired geo.csv loader),
+# whose ids ARE slug-paths. So this works against either style and never does
+# worse than before; whichever path was taken is reported at the end.
 GEO_LEVELS = ["country", "region", "district", "ward", "village"]
 
 
@@ -73,55 +76,93 @@ def _slug(name: str) -> str:
     return name.strip().lower().replace(" ", "_")
 
 
-# (parent_level_value_id or "", lowercased name) -> level_value_id, read once
-# from master-data. Empty when master-data is unreachable or unseeded, which is
-# what puts every lookup on the slug-path fallback.
+# (parent unit id or "", lowercased name) -> unit id, read once from
+# master-data. Empty when master-data is unreachable or unseeded, which is what
+# puts every lookup on the slug-path fallback.
 _GEO_INDEX: dict = {}
 _GEO_STATS = {"resolved": 0, "fallback": 0, "unresolved_examples": []}
 
 
-def load_geo_index() -> dict:
-    """Index master-data's units by (parent id, name) so a name chain resolves.
+# ── Master Data, through its API ─────────────────────────────────────────────
+#
+# Never its database: the registry reads Master Data the way its services do,
+# through MDS's /catalogue and /samples endpoints, as its own Keycloak client.
+# The client is the platform's stdlib one, /seed/mds_client.py in the db-seed
+# base image (MDS_API_URL, MDS_TOKEN_URL, MDS_CLIENT_ID, MDS_CLIENT_SECRET come
+# from the db-seed Job). Run from a checkout, it is found in the sibling
+# registry-platform repo.
 
-    Best effort on purpose. A missing MD_PG* env, an unreachable database or an
-    empty table all mean the same thing here — no ids to resolve against — and
-    none of them should stop sample data loading, which worked without any of
-    this before.
+def _mds_client_module():
+    """(MdsClient, MdsError), or None with the reason printed."""
+    try:
+        from mds_client import MdsClient, MdsError  # /seed/mds_client.py
+        return MdsClient, MdsError
+    except ImportError:
+        pass
+    sibling = Path(__file__).resolve().parents[3] / "registry-platform" / "docker" / "db-seed"
+    if (sibling / "mds_client.py").is_file():
+        sys.path.insert(0, str(sibling))
+        from mds_client import MdsClient, MdsError
+        return MdsClient, MdsError
+    print("[load-sample-data] MDS_API_URL is set but mds_client.py is not importable — "
+          "this db-seed image predates the registry platform's Master Data API client "
+          "(/seed/mds_client.py). Master Data is skipped.")
+    return None
+
+
+_MDS = None  # the client, once opened; False once known to be unavailable
+# What a failed Master Data read raises: MdsError (incl. MdsUnavailable), and a
+# malformed response. Widened once the client is imported.
+_MDS_ERRORS: tuple = (OSError, ValueError)
+
+
+def mds():
+    """The Master Data client, or None when it is not configured or unusable.
+
+    Best effort on purpose. No MDS_API_URL, a base image without the client, or
+    an unreachable MDS all mean the same thing here — nothing to resolve
+    against — and none of them should stop sample data loading.
     """
-    host = os.environ.get("MD_PGHOST")
-    dbname = os.environ.get("MD_PGDATABASE")
-    if not host or not dbname:
-        print("[load-sample-data] MD_PG* not set — geo ids fall back to slug-paths.")
-        return {}
+    global _MDS, _MDS_ERRORS
+    if _MDS is None:
+        _MDS = False
+        if not os.environ.get("MDS_API_URL", "").strip():
+            print("[load-sample-data] MDS_API_URL not set — no Master Data: geo ids fall "
+                  "back to slug-paths and people to the demography CSV.")
+        else:
+            module = _mds_client_module()
+            if module:
+                client_cls, error_cls = module
+                _MDS_ERRORS = (error_cls, OSError, ValueError)
+                _MDS = client_cls.from_env()
+    return _MDS or None
+
+
+def load_geo_units() -> list:
+    """Every active unit of the published geography, from master-data; [] if none."""
+    client = mds()
+    if client is None:
+        return []
     try:
-        conn = psycopg2.connect(
-            host=host,
-            port=os.environ.get("MD_PGPORT", "5432"),
-            dbname=dbname,
-            user=os.environ.get("MD_PGUSER", ""),
-            password=os.environ.get("MD_PGPASSWORD", ""),
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(f"[load-sample-data] master-data unreachable ({exc}) — geo ids fall back to slug-paths.")
-        return {}
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "select level_value_id, level_value_mnemonic, coalesce(parent_level_value_id, '')"
-                "  from g2p_geo_level_values"
-            )
-            index = {(parent, name.strip().lower()): vid for vid, name, parent in cur.fetchall()}
-    except Exception as exc:  # noqa: BLE001
+        return client.all_geo_units()
+    except _MDS_ERRORS as exc:
         print(f"[load-sample-data] could not read master-data geo ({exc}) — slug-paths.")
-        return {}
-    finally:
-        conn.close()
-    print(f"[load-sample-data] master-data geo: {len(index)} units available for resolution.")
+        return []
+
+
+def load_geo_index(units: list) -> dict:
+    """Index master-data's units by (parent id, name) so a name chain resolves."""
+    index = {
+        (u.get("parent_unit_id") or "", str(u.get("name") or "").strip().lower()): u["unit_id"]
+        for u in units
+    }
+    if index:
+        print(f"[load-sample-data] master-data geo: {len(index)} units available for resolution.")
     return index
 
 
-def load_geo_chain_by_id() -> dict:
-    """level_value_id -> (level_mnemonic, name, parent_id), for walking upwards.
+def load_geo_chain_by_id(units: list) -> dict:
+    """unit id -> (level_mnemonic, name, parent_id), for walking upwards.
 
     This is what makes the loader country-agnostic. A record carries the id of
     the one unit it sits in; every level above it — and how many there are, and
@@ -130,31 +171,17 @@ def load_geo_chain_by_id() -> dict:
     describe Kamuntu and nothing else: Ethiopia has four levels and calls the
     middle ones zone and woreda.
     """
-    host = os.environ.get("MD_PGHOST")
-    dbname = os.environ.get("MD_PGDATABASE")
-    if not host or not dbname:
+    if not units:
         return {}
     try:
-        conn = psycopg2.connect(
-            host=host, port=os.environ.get("MD_PGPORT", "5432"), dbname=dbname,
-            user=os.environ.get("MD_PGUSER", ""), password=os.environ.get("MD_PGPASSWORD", ""),
-        )
-    except Exception:  # noqa: BLE001
-        return {}
-    try:
-        with conn.cursor() as cur:
-            cur.execute("select level_id, level_mnemonic from g2p_geo_levels")
-            mnemonic = dict(cur.fetchall())
-            cur.execute("select level_value_id, level_id, level_value_mnemonic,"
-                        " parent_level_value_id from g2p_geo_level_values")
-            return {
-                vid: (mnemonic.get(lid, lid), name, parent)
-                for vid, lid, name, parent in cur.fetchall()
-            }
-    except Exception:  # noqa: BLE001
-        return {}
-    finally:
-        conn.close()
+        mnemonic = {lv["level_id"]: lv.get("level_mnemonic") for lv in mds().geo_levels()}
+    except _MDS_ERRORS:
+        mnemonic = {}
+    return {
+        u["unit_id"]: (mnemonic.get(u.get("level_id")) or u.get("level_id"),
+                       u.get("name"), u.get("parent_unit_id"))
+        for u in units
+    }
 
 
 _GEO_BY_ID: dict = {}
@@ -262,32 +289,15 @@ def load_people_from_mds() -> tuple:
     where the country is declared, so its samples are the ones that match the
     geography and the code lists. What a registry adds on top is its own fields.
     """
-    host = os.environ.get("MD_PGHOST")
-    dbname = os.environ.get("MD_PGDATABASE")
-    if not host or not dbname:
+    client = mds()
+    if client is None:
         return [], []
     try:
-        conn = psycopg2.connect(
-            host=host, port=os.environ.get("MD_PGPORT", "5432"), dbname=dbname,
-            user=os.environ.get("MD_PGUSER", ""), password=os.environ.get("MD_PGPASSWORD", ""),
-        )
-    except Exception:  # noqa: BLE001
-        return [], []
-    try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            for table in ("g2p_sample_individuals", "g2p_sample_households"):
-                cur.execute("select to_regclass(%s)", (f"public.{table}",))
-                if cur.fetchone()["to_regclass"] is None:
-                    return [], []
-            cur.execute("select * from g2p_sample_individuals order by individual_id")
-            inds = [dict(r) for r in cur.fetchall()]
-            cur.execute("select * from g2p_sample_households order by household_id")
-            hhs = [dict(r) for r in cur.fetchall()]
-    except Exception as exc:  # noqa: BLE001
+        inds = client.sample_individuals()
+        hhs = client.sample_households() if inds else []
+    except _MDS_ERRORS as exc:
         print(f"[load-sample-data] could not read master-data samples ({exc}).")
         return [], []
-    finally:
-        conn.close()
 
     if not inds:
         return [], []
@@ -898,8 +908,9 @@ def main() -> None:
     # Before anything derives a geo id. Read once; every record resolves against
     # this rather than reopening master-data per row.
     global _GEO_INDEX, _GEO_BY_ID
-    _GEO_INDEX = load_geo_index()
-    _GEO_BY_ID = load_geo_chain_by_id()
+    units = load_geo_units()
+    _GEO_INDEX = load_geo_index(units)
+    _GEO_BY_ID = load_geo_chain_by_id(units)
 
     # People come from master-data when it carries the country's samples. The
     # CSV is the fallback, and it can only ever describe the one country whose

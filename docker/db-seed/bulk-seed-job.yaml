@@ -6,8 +6,12 @@
 # commons-postgresql over the service network, and is the same shape a seed
 # Job would take at install time.
 #
+# The geography comes from Master Data's API (never its database), read with the
+# registry platform's stdlib client, so ship that beside the script:
+#
 #   kubectl -n <ns> create configmap nsr-bulk-seed \
-#       --from-file=generate_nsr_bulk_sample.py --from-file=distributions.json
+#       --from-file=generate_nsr_bulk_sample.py --from-file=distributions.json \
+#       --from-file=../../../registry-platform/docker/db-seed/mds_client.py
 #   kubectl -n <ns> apply -f bulk-seed-job.yaml
 #   kubectl -n <ns> logs -f job/nsr-bulk-seed
 #
@@ -50,8 +54,20 @@ spec:
                   key: postgres-password
             - name: NSR_DB
               value: nsr
-            - name: MDS_DB
-              value: master_data
+            # Master Data, through its API as the registry's own Keycloak client
+            # (the staff-portal client keycloak-init creates for release `nsr`).
+            # Replace <baseDomain> with the environment's domain.
+            - name: MDS_API_URL
+              value: http://commons-services-master-data-api
+            - name: MDS_TOKEN_URL
+              value: https://keycloak.<baseDomain>/realms/staff/protocol/openid-connect/token
+            - name: MDS_CLIENT_ID
+              value: nsr-staff-portal
+            - name: MDS_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nsr-staff-portal
+                  key: client_secret
           volumeMounts:
             - name: seed
               mountPath: /seed

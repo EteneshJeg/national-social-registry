@@ -33,11 +33,20 @@ global:
   registryDBUser: '{{ printf "%s_user" .Release.Name | replace "-" "_" }}'
   registryDBSecret: '{{ .Release.Name }}'
   registryDBUserPasswordKey: '{{ .Release.Name }}-db-user'
-  masterDataDB: 'master_data'
-  masterDataDBPort: 5432
-  masterDataDBUser: 'master_data_user'
-  masterDataDBSecret: 'master-data'
-  masterDataDBUserPasswordKey: 'master-data-db-user'
+  # Master Data API wiring, mirroring openg2p-registry's own defaults — declared
+  # here for the same reason as the database wiring above: the analytics jobs
+  # (templates/analytics-jobs.yaml) read Master Data through its API, as this
+  # registry's own Keycloak client, and a parent chart cannot see a subchart's
+  # global defaults. Keep in step with the subchart. Neither this chart nor its
+  # seed jobs ever read Master Data's database.
+  keycloakBaseUrl: 'https://keycloak.{{ tpl .Values.global.baseDomain $ }}'
+  keycloakRealm: 'staff'
+  keycloakIssuerUrl: '{{ tpl .Values.global.keycloakBaseUrl $ }}/realms/{{ tpl .Values.global.keycloakRealm $ }}'
+  masterDataApiUrl: 'http://commons-services-master-data-api'
+  masterDataTokenUrl: '{{ tpl .Values.global.keycloakIssuerUrl $ }}/protocol/openid-connect/token'
+  authClientId: '{{ .Release.Name }}-staff-portal'
+  authClientSecret: '{{ .Release.Name }}-staff-portal'
+  authClientSecretKey: 'client_secret'
   # Ingress host for this registry. Overrides the subchart's generic default.
   # Derived from baseDomain (defaulted by the openg2p-registry subchart) so that
   # overriding the domain once moves every host, here and in the platform chart.
@@ -69,22 +78,19 @@ registry:
       repository: openg2p/openg2p-nsr-db-seed
       tag: 0.0.0-develop
     # The subchart defaults these OFF (minimal reference registry). NSR ships
-    # demo records/geo/images, so turn the db-seed loaders on. NB these are
+    # demo records/images, so turn the db-seed loaders on. NB these are
     # `dbSeed.*`, not `global.*` — the db-seed Job reads .Values.dbSeed.load*
     # and there is no global fallback, so setting them under global is inert.
-    # Geo is seeded by the master-data chart now (geoSeed.countryPack there),
-    # not as a side effect of the registry seed. Leaving this on would load a
-    # second, unrelated hierarchy over the one MDS already holds.
-    loadGeoData: false
+    # Geography is Master Data's alone (geoSeed.countryPack in the master-data
+    # chart); the loaders read it, and the sample people, through MDS's API.
     loadSampleData: true
     loadImages: true
     loadTemplates: true
-    # Copy the country's code lists from Master Data, and match the geo dropdowns
-    # to the hierarchy it holds. Both are country-agnostic: they take whatever
-    # pack this environment loaded, and no-op when Master Data carries neither.
-    # This is what lets one NSR image serve any country.
+    # Copy the country's code lists from Master Data's API into this registry's
+    # own attribute tables (LOAD_ATTRIBUTES, load_attributes_from_mds.py in the
+    # pinned openg2p-registry). Inert on platform versions that read code lists
+    # live from Master Data, which dropped the setting; remove it with that pin.
     loadAttributes: true
-    syncGeoWidgets: true
 
   # staffUi and beneApi are consumed as-is from the openg2p-registry base images
   # (subchart defaults already point at openg2p/openg2p-registry-*), so they are
@@ -143,7 +149,6 @@ analytics:
   # copied into /seed by the db-seed image. They used to be read from the shared
   # openg2p-data clone at /openg2p-data, which is what let them drift out of step
   # with the enums they write.
-  waitImage: jbergknoff/postgresql-client:latest
 
   bulkSample:
     enabled: true

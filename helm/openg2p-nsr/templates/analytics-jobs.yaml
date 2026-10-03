@@ -23,7 +23,28 @@ Geography is NOT declared here. It comes from whatever the environment's Master
 Data Service holds — see geoSeed.countryPack in the openg2p-master-data chart.
 The bulk-sample job below refuses to run against an empty MDS rather than
 silently producing records that point nowhere.
+
+Master Data is read through its API only, never its database: as this
+registry's own Keycloak client (global.authClientId, client-credentials grant
+at global.masterDataTokenUrl), with the platform's /seed/mds_client.py.
 */}}
+{{- define "nsr.mdsApiEnv" -}}
+- name: MDS_API_URL
+  value: {{ tpl .Values.global.masterDataApiUrl . | quote }}
+- name: MDS_TOKEN_URL
+  value: {{ tpl .Values.global.masterDataTokenUrl . | quote }}
+- name: MDS_CLIENT_ID
+  value: {{ tpl .Values.global.authClientId . | quote }}
+- name: MDS_CLIENT_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ tpl .Values.global.authClientSecret . | quote }}
+      key: {{ tpl .Values.global.authClientSecretKey . | quote }}
+{{- if .Values.global.catalogueRelease }}
+- name: MDS_RELEASE
+  value: {{ tpl .Values.global.catalogueRelease . | quote }}
+{{- end }}
+{{- end }}
 {{- $ctx := . }}
 {{- $pg := tpl .Values.global.postgresqlHost $ }}
 {{/* These jobs run inside the registry's db-seed image — the same one that
@@ -57,38 +78,14 @@ spec:
       initContainers:
         {{/* Fail loudly on empty geography. Seeding a registry against an MDS
              that has not been populated yet produces records whose geo points
-             at nothing, and nothing downstream notices until a map is blank. */}}
+             at nothing, and nothing downstream notices until a map is blank.
+             Asks MDS's API (the same client the generator uses), in the seed
+             image itself — never MDS's database. */}}
         - name: require-mds-geo
-          image: {{ .Values.analytics.waitImage }}
-          command:
-            - sh
-            - -c
-            - |
-              set -e
-              for i in $(seq 1 60); do
-                n=$(psql -tAc "select count(*) from g2p_geo_level_values" 2>/dev/null || echo 0)
-                if [ "${n:-0}" -gt 0 ]; then
-                  echo "MDS geo present: $n units"; exit 0
-                fi
-                echo "waiting for MDS geo to be seeded..."; sleep 5
-              done
-              echo "ERROR: MDS geo is still empty. Install/seed the master-data" \
-                   "chart (geoSeed.countryPack) before seeding the registry." >&2
-              exit 1
+          image: {{ $seedRepo }}:{{ $seedTag }}
+          command: ["python3", "/seed/mds_client.py", "wait-geo", "--timeout", "300"]
           env:
-            - name: PGHOST
-              value: {{ $pg | quote }}
-            - name: PGPORT
-              value: {{ .Values.global.masterDataDBPort | default 5432 | quote }}
-            - name: PGDATABASE
-              value: {{ tpl .Values.global.masterDataDB $ | quote }}
-            - name: PGUSER
-              value: {{ tpl .Values.global.masterDataDBUser $ | quote }}
-            - name: PGPASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ tpl .Values.global.masterDataDBSecret $ | quote }}
-                  key: {{ tpl .Values.global.masterDataDBUserPasswordKey $ | quote }}
+            {{- include "nsr.mdsApiEnv" $ | nindent 12 }}
       containers:
         - name: bulk-sample
           image: {{ $seedRepo }}:{{ $seedTag }}
@@ -117,8 +114,6 @@ spec:
               value: {{ .Values.global.registryDBPort | default 5432 | quote }}
             - name: NSR_DB
               value: {{ tpl .Values.global.registryDB $ | quote }}
-            - name: MDS_DB
-              value: {{ tpl .Values.global.masterDataDB $ | quote }}
             - name: PGUSER
               value: {{ tpl .Values.global.registryDBUser $ | quote }}
             - name: PGPASSWORD
@@ -126,18 +121,8 @@ spec:
                 secretKeyRef:
                   name: {{ tpl .Values.global.registryDBSecret $ | quote }}
                   key: {{ tpl .Values.global.registryDBUserPasswordKey $ | quote }}
-            {{/* Master Data is a separate database owned by a separate role.
-                 Reading the geo hierarchy as the registry user fails with
-                 "permission denied for table g2p_geo_levels". */}}
-            - name: MDS_PGUSER
-              value: {{ tpl .Values.global.masterDataDBUser $ | quote }}
-            - name: MDS_PGPASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ tpl .Values.global.masterDataDBSecret $ | quote }}
-                  key: {{ tpl .Values.global.masterDataDBUserPasswordKey $ | quote }}
-            - name: MDS_PGPORT
-              value: {{ .Values.global.masterDataDBPort | default 5432 | quote }}
+            {{/* The geography, through Master Data's API. */}}
+            {{- include "nsr.mdsApiEnv" $ | nindent 12 }}
           resources: {{- toYaml .Values.analytics.resources | nindent 12 }}
 {{- end }}
 
@@ -205,28 +190,9 @@ spec:
             {{/* Master Data owns the country pack, and the hierarchy DEPTH comes
                  from it rather than from registered rows. A production registry
                  is installed empty, so measuring the data gave every view zero
-                 geo columns on precisely the install that matters. It is a
-                 separate database owned by a separate role — reading it as the
-                 registry user fails with "permission denied for
-                 g2p_geo_levels". */}}
-            - name: MDS_DB
-              value: {{ tpl .Values.global.masterDataDB $ | quote }}
-            {{- /* Only when Master Data is somewhere else. Unset, the script
-                   falls back to PGHOST, which is right in every deployment
-                   where the two databases share a Postgres. */}}
-            {{- if .Values.global.masterDataDBHost }}
-            - name: MDS_PGHOST
-              value: {{ tpl .Values.global.masterDataDBHost $ | quote }}
-            {{- end }}
-            - name: MDS_PGPORT
-              value: {{ .Values.global.masterDataDBPort | default 5432 | quote }}
-            - name: MDS_PGUSER
-              value: {{ tpl .Values.global.masterDataDBUser $ | quote }}
-            - name: MDS_PGPASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ tpl .Values.global.masterDataDBSecret $ | quote }}
-                  key: {{ tpl .Values.global.masterDataDBUserPasswordKey $ | quote }}
+                 geo columns on precisely the install that matters. Read through
+                 MDS's API as this registry's own client, never its database. */}}
+            {{- include "nsr.mdsApiEnv" $ | nindent 12 }}
           resources: {{- toYaml .Values.analytics.resources | nindent 12 }}
           {{- /* DEVELOPMENT ONLY. Mounts the reporting scripts from a ConfigMap
                  over the ones baked into the image, so a change to the SQL or

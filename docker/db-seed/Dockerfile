@@ -1,8 +1,9 @@
 # National Social Registry — DB-seed image.
 #
 # Thin extension of the registry-platform db-seed base image. The base ships the
-# seeding machinery (entrypoint.sh, the shared openg2p-data clone, geo loader,
-# template uploader) plus the reference registry's seed content. This image
+# seeding machinery (entrypoint.sh, the shared openg2p-data clone, the Master
+# Data API client mds_client.py, template uploader) plus the reference
+# registry's seed content. This image
 # replaces the seed content with NSR's, and overrides the two loaders that are
 # NOT domain-agnostic.
 #
@@ -14,8 +15,15 @@
 #   tables), so inheriting them makes the Job crash-loop on LOAD_SAMPLE_DATA=true.
 #   NSR therefore ships its own, copied over the inherited ones below.
 #
-#   Genuinely generic and inherited unchanged: entrypoint.sh, load_geo_data.py
-#   (geo is registry-agnostic), upload_templates.py, requirements.txt.
+#   Genuinely generic and inherited unchanged: entrypoint.sh, mds_client.py,
+#   upload_templates.py, generate_reporting_views.py, requirements.txt.
+#
+# MASTER DATA
+#   Seeding writes only NSR's own database. Geography, the country pack's sample
+#   people and code lists are Master Data's; NSR's loaders (load_sample_data.py,
+#   generate_nsr_bulk_sample.py) read them through MDS's API with the base
+#   image's /seed/mds_client.py — never MDS's database. The base image must
+#   therefore be a platform version that ships that client (RP_VERSION below).
 #
 # The entrypoint (inherited) reads /seed/* at container-run time; behaviour is
 # toggled entirely via env from the Helm Job.
