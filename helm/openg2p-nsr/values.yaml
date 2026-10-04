@@ -22,6 +22,12 @@ global:
   baseDomain: '{{ .Release.Namespace }}.openg2p.org'
 
   registryVariant: 'nsr'
+
+  # Object store: the in-cluster commons Garage (S3-compatible; replaced MinIO).
+  # Same as the openg2p-registry subchart default; set here too so this chart
+  # works on subchart versions that still default to the old MinIO host.
+  minioHost: 'commons-garage:3900'
+  minioSecure: false
   # Database wiring, mirroring openg2p-registry's own defaults. Declared here
   # rather than inherited because a parent chart's templates cannot read a
   # subchart's global defaults, and this chart's analytics jobs need them.
