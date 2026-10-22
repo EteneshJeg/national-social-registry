@@ -224,8 +224,8 @@ PROGRAM_NAMES, PROGRAM_WEIGHTS = names_and_weights(PROGRAMS)
 TENURE_NAMES, TENURE_WEIGHTS = names_and_weights(TENURE)
 DISPLACEMENT_NAMES, DISPLACEMENT_WEIGHTS = names_and_weights(DISPLACEMENT)
 PASTORALIST_NAMES, PASTORALIST_WEIGHTS = names_and_weights(PASTORALIST)
-# SELF, not HEAD — RelationshipToHeadEnum names the head's own row SELF.
-RELATIONSHIPS = ["SELF", "SPOUSE", "CHILD", "PARENT", "SIBLING", "OTHER_RELATIVE"]
+# The household head is marked using is_head, not a SELF relationship.
+RELATIONSHIPS = ["SPOUSE", "CHILD", "PARENT", "SIBLING", "OTHER_RELATIVE"]
 MARITAL = ["SINGLE", "MARRIED", "WIDOWED", "DIVORCED", "SEPARATED"]
 
 
@@ -261,27 +261,6 @@ def read_code_lists(conn):
         for aid, code in cur.fetchall():
             out.setdefault(aid, []).append(code)
     return out
-
-
-def head_relationship(conn, fallback):
-    """The value meaning 'head of household', asked for by ROLE.
-
-    Not by position and not by name. `RELATIONSHIPS[0]` happened to be SELF, so
-    every head was labelled correctly only for as long as a country used that
-    code in that slot — and a country that does not would have had every head
-    silently mislabelled, with no error anywhere.
-    """
-    with conn.cursor() as cur:
-        cur.execute("select to_regclass('public.g2p_attribute_value_roles')")
-        if cur.fetchone()[0] is None:
-            return fallback
-        cur.execute("""
-            select v.value_code from g2p_attribute_values v
-              join g2p_attribute_value_roles r on r.value_id = v.value_id
-             where r.role = 'head_of_household' order by v.sort_order limit 1
-        """)
-        row = cur.fetchone()
-    return row[0] if row else fallback
 
 
 def reconcile_with_code_lists(conn):
@@ -340,10 +319,7 @@ def reconcile_with_code_lists(conn):
         stem = {"PROGRAMS": "PROGRAM"}.get(base, base)
         g[f"{stem}_NAMES"], g[f"{stem}_WEIGHTS"] = names_and_weights(g[base])
 
-    g["RELATIONSHIPS"] = ([head_relationship(conn, g["RELATIONSHIPS"][0])]
-                          + [r for r in g["RELATIONSHIPS"]
-                             if r != head_relationship(conn, g["RELATIONSHIPS"][0])])
-    print(f"[bulk-seed] head of household = {g['RELATIONSHIPS'][0]!r} (by role)")
+
     if dropped:
         print("[bulk-seed] not generating values absent from this registry's lists:")
         for d in dropped: print(f"[bulk-seed]     {d}")
