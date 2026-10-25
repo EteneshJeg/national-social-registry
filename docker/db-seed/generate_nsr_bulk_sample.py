@@ -189,7 +189,7 @@ TENURE = [("OWNED", 62), ("RENTED", 18), ("HOSTED", 12), ("TEMPORARY", 8)]
 HEADSHIP = ["MALE_HEADED", "FEMALE_HEADED", "CHILD_HEADED", "ELDERLY_HEADED"]
 # Must be members of the extension's ProgramEnum
 # (nsr-extension/.../register_domain/models/enums.py), which in turn matches the
-# PROGRAM_NAME value_id rows in g2p_attribute_values.
+# PROGRAM_NAME code list in Master Data.
 #
 # program_name is a plain String column, not a native PG enum, so an invalid
 # value INSERTs happily and only surfaces later — the API rejects the row on
@@ -230,7 +230,7 @@ MARITAL = ["SINGLE", "MARRIED", "WIDOWED", "DIVORCED", "SEPARATED"]
 
 
 # Which generator constant feeds which code list. Anything listed here is
-# reconciled against the registry's own g2p_attribute_values before use.
+# reconciled against Master Data's list of the same code before use.
 CODE_LISTS = {
     "DISPLACEMENT": "DISPLACEMENT_STATUS",
     "HEADSHIP": "HEADSHIP_TYPE",
@@ -249,22 +249,31 @@ HOUSING_LISTS = {
 }
 
 
-def read_code_lists(conn):
-    """attribute_id -> ordered value codes, from the registry's own tables."""
-    with conn.cursor() as cur:
-        cur.execute("select to_regclass('public.g2p_attribute_values')")
-        if cur.fetchone()[0] is None:
-            return {}
-        cur.execute("select attribute_id, value_code from g2p_attribute_values"
-                    " order by attribute_id, sort_order")
-        out = {}
-        for aid, code in cur.fetchall():
-            out.setdefault(aid, []).append(code)
+def read_code_lists(mds):
+    """attribute_id -> ordered value codes, from Master Data's API.
+
+    Never the registry's own g2p_attribute_values: the registry reads its code
+    lists live from Master Data, so that table can be empty.
+    """
+    from mds_client import MdsError
+
+    out = {}
+    for aid in sorted(set(CODE_LISTS.values()) | set(HOUSING_LISTS.values())):
+        try:
+            values = mds.list_values(aid)
+        except MdsError as exc:
+            raise SystemExit(
+                f"[bulk-seed] could not read code list {aid} from Master Data: {exc}")
+        if not values:
+            print(f"[bulk-seed] WARNING: Master Data has no {aid} list — its "
+                  "built-in values are generated unchecked")
+            continue
+        out[aid] = [v["value_code"] for v in values]
     return out
 
 
-def reconcile_with_code_lists(conn):
-    """Drop generated values the registry's code lists do not contain.
+def reconcile_with_code_lists(mds):
+    """Drop generated values Master Data's code lists do not contain.
 
     The lists here are hand-written and ordered — deprived_pick reads them
     worst-to-best, so the ORDER carries the deprivation gradient and cannot be
@@ -276,11 +285,11 @@ def reconcile_with_code_lists(conn):
     reported, not added — inserting it into a worst-to-best sequence at an
     arbitrary point would silently change what the data says about poverty.
     """
-    seeded = read_code_lists(conn)
+    seeded = read_code_lists(mds)
     if not seeded:
-        print("[bulk-seed] no code lists in this registry — generating from "
-              "built-in values")
-        return
+        raise SystemExit(
+            "[bulk-seed] Master Data has none of the code lists this script uses — "
+            "load a country pack into Master Data first.")
 
     g = globals()
     dropped, unused = [], []
@@ -1080,9 +1089,14 @@ def main():
             print("[bulk-seed] Re-run with --purge first to regenerate.")
             return 0
 
-    # Before anything is generated: keep only values this registry's code lists
-    # actually contain, and find the head-of-household value by role.
-    reconcile_with_code_lists(conn)
+    # Code lists and geography are Master Data's, read through its API (never its
+    # database) as this registry's own client. Opened here, after the
+    # purge/already-seeded exits, which need neither.
+    mds = mds_client()
+
+    # Before anything is generated: keep only values Master Data's code lists
+    # actually contain.
+    reconcile_with_code_lists(mds)
 
     dist = load_distributions(args.distributions, rng)
 
@@ -1109,10 +1123,7 @@ def main():
     started = datetime.now()
     print(f"[bulk-seed] target {args.db} @ {dsn['host']}:{dsn['port']}"
           f"{' (DRY RUN)' if args.dry_run else ''}")
-    # The geography is Master Data's, read through its API (never its database)
-    # as this registry's own client. Opened here, after the purge/already-seeded
-    # exits, which need no geography.
-    totals = generate(conn, mds_client(), args, dist, rng)
+    totals = generate(conn, mds, args, dist, rng)
     elapsed = (datetime.now() - started).total_seconds()
 
     print(f"\n[bulk-seed] done in {elapsed:.0f}s")
