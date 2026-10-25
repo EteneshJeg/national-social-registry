@@ -871,7 +871,7 @@ def generate(conn, mds, args, dist, rng):
                 "educational_status": education,
                 "occupation": livelihood,
                 "registration_date": base,
-                "relationship_to_head": RELATIONSHIPS[0] if is_head else rng.choice(RELATIONSHIPS[1:]),
+                "relationship_to_head": None if is_head else rng.choice(RELATIONSHIPS),
                 "is_head": is_head,
                 # CitizenshipCategoryEnum has no NON_CITIZEN; RESIDENT is the
                 # non-citizen-but-settled category.
