@@ -11,6 +11,7 @@ from .utils.validations import (
     has_keys,
     is_blank,
     parse_date,
+    validate_enum_values,
     validation_error,
 )
 from .utils.household_roster import (
@@ -25,9 +26,45 @@ from .utils.household_roster import (
 _logger = logging.getLogger("g2p-register-domain-service")
 
 
+def _enum_fields() -> dict:
+    # Imported lazily: ..models imports these services at module level, so a
+    # top-level import here would be circular whenever services load first.
+    from openg2p_registry_core.models import GenderEnum, MaritalStatusEnum
+    from ..models.enums import (
+        AgeMethodEnum,
+        CitizenshipCategoryEnum,
+        DisabilityStatusEnum,
+        DisplacementStatusEnum,
+        EmploymentStatusEnum,
+        IdentityEvidenceTypeEnum,
+        PastoralistClassificationEnum,
+        PreferredContactMethodEnum,
+        RelationshipToHeadEnum,
+        ResidencyStatusEnum,
+        VerificationStatusEnum,
+    )
+
+    return {
+        "gender": GenderEnum,
+        "marital_status": MaritalStatusEnum,
+        "foundational_id_verification_status": VerificationStatusEnum,
+        "identity_evidence_type": IdentityEvidenceTypeEnum,
+        "age_method": AgeMethodEnum,
+        "citizenship_category": CitizenshipCategoryEnum,
+        "relationship_to_head": RelationshipToHeadEnum,
+        "residency_status": ResidencyStatusEnum,
+        "preferred_contact_method": PreferredContactMethodEnum,
+        "disability_status": DisabilityStatusEnum,
+        "displacement_status": DisplacementStatusEnum,
+        "pastoralist_classification": PastoralistClassificationEnum,
+        "employment_status": EmploymentStatusEnum,
+    }
+
+
 class G2PRegisterDomainServiceIndividual(G2PRegisterDomainService):
     async def validate_domain_attributes(self, records: list[dict]):
         for record in records:
+            validate_enum_values(record, _enum_fields())
             self._validate_middle_name(record)
             self._validate_birth_date(record)
             self._validate_estimated_age(record)
