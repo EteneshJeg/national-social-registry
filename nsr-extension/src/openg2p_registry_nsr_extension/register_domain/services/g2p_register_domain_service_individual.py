@@ -7,6 +7,7 @@ from openg2p_registry_core.services import G2PRegisterDomainService
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .utils.validations import (
+    as_bool,
     as_int,
     has_keys,
     is_blank,
@@ -68,6 +69,23 @@ class G2PRegisterDomainServiceIndividual(G2PRegisterDomainService):
             self._validate_middle_name(record)
             self._validate_birth_date(record)
             self._validate_estimated_age(record)
+            self._validate_relationship_to_head(record)
+
+    def _validate_relationship_to_head(self, record: dict) -> None:
+        if "is_head" not in record and "relationship_to_head" not in record:
+            # Partial payload that does not touch headship (e.g. an API change
+            # request editing another field) — nothing to check here.
+            return
+        if as_bool(record.get("is_head")) is True:
+            # The head is marked by is_head (NSR-07), not by a relationship. A
+            # value chosen on the form before ticking is_head is still
+            # submitted, so drop it and store the head without one.
+            record["relationship_to_head"] = None
+            return
+        if is_blank(record.get("link_internal_record_id")):
+            return
+        if is_blank(record.get("relationship_to_head")):
+            validation_error("relationship_to_head is required for household members")
 
     def _validate_middle_name(self, record: dict) -> None:
         if not has_keys(record, "middle_name"):
