@@ -4,6 +4,7 @@ from datetime import date
 from openg2p_registry_core.models import G2PRegisterChangeRequest
 from openg2p_registry_core.models.enum import ChangeActionEnum
 from openg2p_registry_core.services import G2PRegisterDomainService
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .utils.validations import (
@@ -19,6 +20,7 @@ from .utils.household_roster import (
     affected_household_ids,
     calculate_age,
     has_roster_affecting_changes,
+    is_active_member,
     member_payload,
     normalize_link,
     recompute_household_roster_for_household,
@@ -70,6 +72,55 @@ class G2PRegisterDomainServiceIndividual(G2PRegisterDomainService):
             self._validate_birth_date(record)
             self._validate_estimated_age(record)
             self._validate_relationship_to_head(record)
+        self._validate_single_head(records)
+
+    def _validate_single_head(self, records: list[dict]) -> None:
+        # Records saved together without a household link (e.g. the members
+        # of one intake form) are counted as one household.
+        heads_per_household: dict[str | None, int] = {}
+        for record in records:
+            if as_bool(record.get("is_head")) is not True:
+                continue
+            household_id = normalize_link(record.get("link_internal_record_id"))
+            heads_per_household[household_id] = heads_per_household.get(household_id, 0) + 1
+        if any(count > 1 for count in heads_per_household.values()):
+            validation_error("Only one household member can be the head")
+
+    async def _validate_no_existing_head(
+        self,
+        change_request: G2PRegisterChangeRequest,
+        record: dict,
+        individual,
+        session: AsyncSession,
+    ) -> None:
+        """Reject a change that makes someone head of a household that already has one."""
+        from openg2p_registry_core.models import RecordStatusEnum
+        from ..models.individual import G2PRegisterIndividual
+
+        if not any(key in record for key in ("is_head", "link_internal_record_id", "record_status")):
+            return
+        merged = {**(individual.to_dict() if individual else {}), **record}
+        if as_bool(merged.get("is_head")) is not True or not is_active_member(merged):
+            return
+        household_id = normalize_link(merged.get("link_internal_record_id"))
+        if not household_id:
+            return
+
+        existing_head = await session.execute(
+            select(G2PRegisterIndividual.internal_record_id)
+            .where(
+                G2PRegisterIndividual.link_internal_record_id == household_id,
+                G2PRegisterIndividual.is_head.is_(True),
+                G2PRegisterIndividual.internal_record_id != change_request.internal_record_id,
+                or_(
+                    G2PRegisterIndividual.record_status.is_(None),
+                    G2PRegisterIndividual.record_status == RecordStatusEnum.ACTIVE.value,
+                ),
+            )
+            .limit(1)
+        )
+        if existing_head.first() is not None:
+            validation_error("Only one household member can be the head")
 
     def _validate_relationship_to_head(self, record: dict) -> None:
         if "is_head" not in record and "relationship_to_head" not in record:
@@ -188,6 +239,15 @@ class G2PRegisterDomainServiceIndividual(G2PRegisterDomainService):
         individual = await session.get(
             G2PRegisterIndividual, change_request.internal_record_id
         )
+
+        for record in payload_obj.change_payload:
+            if record.get("edit_action") in {
+                ChangeActionEnum.DELETE.value,
+                ChangeActionEnum.NO_CHANGE.value,
+            }:
+                continue
+            await self._validate_no_existing_head(change_request, record, individual, session)
+
         if not individual:
             return
 
